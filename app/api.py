@@ -55,7 +55,9 @@ async def replay_endpoint(request: Request) -> JSONResponse:
     except ReplayError as exc:
         # Validation failures are 4xx: the submitted log is unpublishable.
         # Only the stable error payload is ever returned — no partial zone.
-        logger.info("replay rejected: %s at change %s", exc.code, exc.change)
+        logger.info(
+            "replay rejected: %s at change %s step %s", exc.code, exc.change, exc.step
+        )
         return JSONResponse(status_code=422, content={"error": exc.to_payload()})
 
     return JSONResponse(status_code=200, content=result)

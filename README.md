@@ -14,7 +14,8 @@ change-located error code and **no partial snapshot is ever returned**.
   "start": [ <RR>, ... ],
   "changes": [
     { "deletes": [ <RR>, ... ], "adds": [ <RR>, ... ] }
-  ]
+  ],
+  "rollback_serials": [ <uint32>, ... ]   // optional
 }
 ```
 
@@ -22,6 +23,11 @@ change-located error code and **no partial snapshot is ever returned**.
   contain exactly one SOA.
 * `changes`: **1–64** ordered changes; total records across the request
   (start + every delete/add) must not exceed **5000**.
+* `rollback_serials` *(optional)*: exactly one 32-bit serial per change, given
+  **in rollback order**. The first must strictly advance (RFC 1982) from the
+  forward final serial, and each later one from its predecessor. When present,
+  the response gains a ready-to-publish `rollback_changes` plan (see below).
+  When omitted, the request/response/digest/error semantics are unchanged.
 
 Record shape:
 
@@ -60,9 +66,36 @@ Record shape:
   "final_serial": 1,
   "changes_applied": 3,
   "records": [ { "name": "...", "type": "...", "ttl": 300, ... } ],
-  "sha256": "<sha-256 of the canonical, stably ordered snapshot>"
+  "sha256": "<sha-256 of the canonical, stably ordered snapshot>",
+  "rollback_changes": [
+    { "deletes": [ <RR>, ... ], "adds": [ <RR>, ... ] }
+  ]
 }
 ```
+
+`rollback_changes` is only present when `rollback_serials` was sent.
+
+### Rollback plans
+
+With `rollback_serials` set, the response's `rollback_changes` is the forward
+log **inverted in reverse order**: step *i* undoes forward change *n+1−i*. Each
+step starts by deleting the SOA current at that point (the forward final SOA
+for step 1, then the SOA published by the previous step) and ends by
+republishing the **historical SOA parameters** of the change it undoes under
+the requested new serial — so serials keep advancing while the zone content
+walks back, one version at a time.
+
+Posting the plan back to the same endpoint with the forward `records` as
+`start` replays cleanly and restores the starting zone **except the SOA
+serial** (which ends at the last rollback serial):
+
+```json
+{ "start": <records from the forward response>, "changes": <rollback_changes> }
+```
+
+Rollback validation failures are `422` with a stable code and a 1-based
+`step` locating the offending rollback serial; no forward snapshot or partial
+plan is ever returned on failure.
 
 `422 Unprocessable Entity` for an unpublishable log:
 
@@ -98,6 +131,12 @@ offending entry within that change's delete/add sequence (0-based).
 | `TTL_MISMATCH` | RRset members carry different TTLs |
 | `CNAME_CONFLICT` | CNAME coexists with other data |
 | `NAME_OUTSIDE_ZONE` | Record owner is outside the zone apex |
+| `ROLLBACK_SERIALS_COUNT_MISMATCH` | `rollback_serials` length ≠ number of changes |
+| `ROLLBACK_SERIAL_INVALID` | Rollback serial is not a 32-bit unsigned integer |
+| `ROLLBACK_SERIAL_NOT_ADVANCED` | Rollback serial does not strictly advance (RFC 1982) |
+
+Rollback errors carry a 1-based `step` (position in `rollback_serials`)
+instead of `change`/`record`.
 
 ## Running with Docker
 
@@ -109,9 +148,10 @@ curl -s http://localhost:9090/healthz
 
 ### One-shot verification
 
-The `verify` service runs the build check, the full test suite, and an HTTP
-smoke test against the live API — including a serial-wraparound replay — then
-exits and reports the verdict via its exit code:
+The `verify` service runs the build check, the full regression suite, and an
+HTTP smoke test against the live API — including a serial-wraparound replay
+and a rollback-plan round trip — then exits and reports the verdict via its
+exit code:
 
 ```bash
 docker compose up --build verify
