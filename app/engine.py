@@ -17,6 +17,16 @@ Rules implemented:
 * The apex always holds exactly one SOA.
 * A failing change — and therefore the whole replay — never produces a partial
   snapshot: each change is applied to a private copy first.
+
+Optionally the caller may attach ``rollback_serials`` — one 32-bit serial per
+forward change, in rollback order. The first must strictly advance from the
+forward final serial and each subsequent one from the previous rollback
+serial, per the same RFC 1982 rules. The response then also carries
+``rollback_changes``: the forward changes inverted in reverse order, each
+opening with the SOA live at that rollback moment and closing with the
+historical SOA parameters carrying the prescribed new serial. Resubmitting
+that plan against the forward ``records`` restores every previous zone
+version step by step (the SOA serial ends at the last rollback serial).
 """
 
 from __future__ import annotations
@@ -52,6 +62,7 @@ class ReplayError(Exception):
         *,
         record: int | None = None,
         field: str | None = None,
+        rollback: int | None = None,
     ) -> None:
         super().__init__(message or rule)
         self.code = code
@@ -60,6 +71,7 @@ class ReplayError(Exception):
         self.message = message or rule
         self.record = record
         self.field = field
+        self.rollback = rollback
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -72,6 +84,8 @@ class ReplayError(Exception):
             payload["record"] = self.record
         if self.field is not None:
             payload["field"] = self.field
+        if self.rollback is not None:
+            payload["rollback"] = self.rollback
         return payload
 
 
@@ -320,6 +334,47 @@ def _records_list(value: Any, change: int, key: str) -> list[Any]:
     return value
 
 
+def _rollback_serials(payload: dict[str, Any], change_count: int) -> list[int] | None:
+    """Validate the optional ``rollback_serials`` request member.
+
+    Returns ``None`` when the member is absent (legacy behaviour) or the
+    validated list of 32-bit serials — exactly one per forward change, in
+    rollback order. Count mismatches are reported at the first 1-based
+    rollback step where the two lists disagree.
+    """
+
+    if "rollback_serials" not in payload:
+        return None
+    value = payload["rollback_serials"]
+    if not isinstance(value, list):
+        raise ReplayError(
+            "REQUEST_MALFORMED",
+            "rollback_serials_must_be_array",
+            field="rollback_serials",
+        )
+    if len(value) != change_count:
+        raise ReplayError(
+            "ROLLBACK_SERIALS_MISMATCH",
+            "rollback_serials_count_must_match_changes",
+            rollback=min(len(value), change_count) + 1,
+        )
+    serials: list[int] = []
+    for step, entry in enumerate(value, start=1):
+        if (
+            isinstance(entry, bool)
+            or not isinstance(entry, int)
+            or not 0 <= entry < SERIAL_MOD
+        ):
+            raise ReplayError(
+                "REQUEST_MALFORMED",
+                "rollback_serial_must_be_uint32",
+                field="rollback_serials",
+                rollback=step,
+            )
+        serials.append(entry)
+    return serials
+
+
 def _name_in_zone(name: str, apex: str) -> bool:
     return name == apex or name.endswith("." + apex)
 
@@ -357,6 +412,8 @@ def replay(payload: Any) -> dict[str, Any]:
             "REQUEST_LIMIT", "record_count_exceeds_5000", field="records"
         )
 
+    rollback_serials = _rollback_serials(payload, len(changes))
+
     # --- Build the starting zone -------------------------------------------------
     zone: dict[tuple[str, str], RRset] = {}
     apex: str | None = None
@@ -390,6 +447,9 @@ def replay(payload: Any) -> dict[str, Any]:
     current_serial: int = soa_record.rdata[2]
 
     # --- Apply changes sequentially, each atomically -----------------------------
+    # (old SOA, new SOA, non-SOA deletes, non-SOA adds) per applied change,
+    # captured only when a rollback plan was requested.
+    applied: list[tuple[Record, Record, list[Record], list[Record]]] = []
     for change_index, raw_change in enumerate(changes, start=1):
         if not isinstance(raw_change, dict):
             raise ReplayError(
@@ -438,6 +498,7 @@ def replay(payload: Any) -> dict[str, Any]:
         _delete(candidate, first, change_index, 0)
 
         # Remaining deletes: ordinary RRs only, each must exist.
+        deleted: list[Record] = []
         for position, raw_record in enumerate(deletes[1:], start=1):
             record = normalize_record(raw_record, change_index, position)
             if not _name_in_zone(record.name, apex):
@@ -455,8 +516,10 @@ def replay(payload: Any) -> dict[str, Any]:
                     record=position,
                 )
             _delete(candidate, record, change_index, position)
+            deleted.append(record)
 
         # Adds: the last operation is the new unique SOA.
+        added: list[Record] = []
         for position, raw_record in enumerate(adds, start=1):
             record = normalize_record(raw_record, change_index, position)
             is_last = position == len(adds)
@@ -497,6 +560,7 @@ def replay(payload: Any) -> dict[str, Any]:
                         record=position,
                     )
             _add(candidate, record, change_index, position)
+            added.append(record)
 
         # The candidate must finish with exactly one SOA at the apex.
         apex_types = _types_at(candidate, apex)
@@ -507,13 +571,86 @@ def replay(payload: Any) -> dict[str, Any]:
 
         zone = candidate
         current_serial = _soa_serial(zone, apex)
+        if rollback_serials is not None:
+            # The last add is guaranteed to be the new SOA at this point.
+            applied.append((first, added[-1], deleted, added[:-1]))
 
-    return build_snapshot(zone, apex, current_serial, len(changes))
+    result = build_snapshot(zone, apex, current_serial, len(changes))
+    if rollback_serials is not None:
+        # Serials are checked against the forward final serial only after the
+        # whole forward replay succeeded; any failure here still yields no
+        # snapshot and no partial plan.
+        _validate_rollback_serials(rollback_serials, current_serial)
+        result["rollback_changes"] = build_rollback_plan(applied, rollback_serials)
+    return result
 
 
 def _soa_serial(zone: dict[tuple[str, str], RRset], apex: str) -> int:
     rdata = next(iter(zone[(apex, "SOA")].rdatas))
     return rdata[2]
+
+
+# ---------------------------------------------------------------------------
+# Rollback plan generation
+# ---------------------------------------------------------------------------
+
+
+def _validate_rollback_serials(
+    rollback_serials: list[int], final_serial: int
+) -> None:
+    """Each rollback serial must strictly advance per RFC 1982: the first
+    from the forward final serial, every next one from its predecessor."""
+
+    previous = final_serial
+    for step, serial in enumerate(rollback_serials, start=1):
+        if not serial_advances(previous, serial):
+            raise ReplayError(
+                "ROLLBACK_SERIAL_NOT_ADVANCED",
+                "rollback_serial_must_advance_per_rfc1982",
+                rollback=step,
+            )
+        previous = serial
+
+
+def _soa_with_serial(record: Record, serial: int) -> Record:
+    """The same SOA RR — owner, TTL, mname/rname and timers — new serial."""
+
+    rdata = (record.rdata[0], record.rdata[1], serial, *record.rdata[3:])
+    return Record(name=record.name, rtype=record.rtype, ttl=record.ttl, rdata=rdata)
+
+
+def build_rollback_plan(
+    applied: list[tuple[Record, Record, list[Record], list[Record]]],
+    rollback_serials: list[int],
+) -> list[dict[str, Any]]:
+    """Invert the applied forward changes, in reverse order.
+
+    Step 1 undoes the last forward change. Every step opens by deleting the
+    SOA that is live at that rollback moment — the forward final SOA for
+    step 1, thereafter the previous step's closing SOA (historical
+    parameters, previous rollback serial) — and closes by re-adding the
+    historical SOA parameters with the serial prescribed for that step.
+    Non-SOA records are inverted member-wise in reverse order, so feeding
+    the plan back to :func:`replay` with the forward ``records`` as the
+    starting zone restores each earlier zone version step by step.
+    """
+
+    plan: list[dict[str, Any]] = []
+    total = len(applied)
+    for step in range(1, total + 1):
+        old_soa, new_soa, deleted, added = applied[total - step]
+        live_serial = new_soa.rdata[2] if step == 1 else rollback_serials[step - 2]
+        opening_soa = _soa_with_serial(new_soa, live_serial)
+        closing_soa = _soa_with_serial(old_soa, rollback_serials[step - 1])
+        plan.append(
+            {
+                "deletes": [_record_payload(opening_soa)]
+                + [_record_payload(record) for record in reversed(added)],
+                "adds": [_record_payload(record) for record in reversed(deleted)]
+                + [_record_payload(closing_soa)],
+            }
+        )
+    return plan
 
 
 # ---------------------------------------------------------------------------
@@ -543,6 +680,18 @@ def _rdata_tokens(rtype: str, rdata: tuple[Any, ...]) -> list[str]:
     if rtype == "SOA":
         return [str(part) for part in rdata]
     return [str(rdata[0])]
+
+
+def _record_payload(record: Record) -> dict[str, Any]:
+    """Canonical request/response shape for one normalized record."""
+
+    payload: dict[str, Any] = {
+        "name": record.name,
+        "type": record.rtype,
+        "ttl": record.ttl,
+    }
+    payload.update(_rdata_fields(record.rtype, record.rdata))
+    return payload
 
 
 def canonical_records(

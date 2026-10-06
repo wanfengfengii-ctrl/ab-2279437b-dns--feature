@@ -14,7 +14,8 @@ change-located error code and **no partial snapshot is ever returned**.
   "start": [ <RR>, ... ],
   "changes": [
     { "deletes": [ <RR>, ... ], "adds": [ <RR>, ... ] }
-  ]
+  ],
+  "rollback_serials": [ <u32>, ... ]   // optional
 }
 ```
 
@@ -22,6 +23,12 @@ change-located error code and **no partial snapshot is ever returned**.
   contain exactly one SOA.
 * `changes`: **1–64** ordered changes; total records across the request
   (start + every delete/add) must not exceed **5000**.
+* `rollback_serials` *(optional)*: exactly one 32-bit serial per forward
+  change, **in rollback order**. The first must strictly advance from the
+  forward final serial and each subsequent one from the previous rollback
+  serial (same RFC 1982 rules). When present, the response gains a
+  publishable `rollback_changes` plan (see below). When omitted, the
+  request/response/summary/error semantics are exactly as before.
 
 Record shape:
 
@@ -60,9 +67,27 @@ Record shape:
   "final_serial": 1,
   "changes_applied": 3,
   "records": [ { "name": "...", "type": "...", "ttl": 300, ... } ],
-  "sha256": "<sha-256 of the canonical, stably ordered snapshot>"
+  "sha256": "<sha-256 of the canonical, stably ordered snapshot>",
+  "rollback_changes": [
+    { "deletes": [ <RR>, ... ], "adds": [ <RR>, ... ] }
+  ]
 }
 ```
+
+`rollback_changes` is present only when `rollback_serials` was supplied. It
+inverts the forward changes in reverse order: step 1 undoes the last forward
+change, opening with the SOA live at that rollback moment and closing with
+the historical SOA parameters carrying the prescribed rollback serial.
+Resubmitting it against the forward `records` restores each earlier zone
+version step by step:
+
+```json
+{ "start": <forward records>, "changes": <rollback_changes> }
+```
+
+replays cleanly and ends with the original zone content — every canonical
+record and the SOA parameters — except the SOA serial, which finishes at the
+last rollback serial.
 
 `422 Unprocessable Entity` for an unpublishable log:
 
@@ -79,13 +104,15 @@ Record shape:
 ```
 
 `change` is 1-based (`0` denotes the starting zone); `record` locates the
-offending entry within that change's delete/add sequence (0-based).
+offending entry within that change's delete/add sequence (0-based). Rollback
+validation failures additionally carry `rollback`, the 1-based rollback step
+at fault, and never return the forward snapshot or a partial plan.
 
 ### Stable error codes
 
 | Code | Meaning |
 |------|---------|
-| `REQUEST_MALFORMED` / `REQUEST_LIMIT` | Bad envelope, or >5000 records / >64 changes |
+| `REQUEST_MALFORMED` / `REQUEST_LIMIT` | Bad envelope (incl. malformed `rollback_serials`), or >5000 records / >64 changes |
 | `INVALID_RECORD` | Malformed field, bad address/name, unsupported type |
 | `INITIAL_SOA_MISSING` / `INITIAL_SOA_MULTIPLE` | Starting zone SOA invariants |
 | `CHANGE_MUST_START_WITH_SOA` | First delete is not the current SOA |
@@ -93,6 +120,8 @@ offending entry within that change's delete/add sequence (0-based).
 | `UNEXPECTED_SOA` | Extra/misplaced SOA inside a change |
 | `SOA_NOT_AT_APEX` / `SOA_NOT_UNIQUE` | Apex SOA invariants |
 | `SERIAL_NOT_ADVANCED` | RFC 1982 serial not strictly forward |
+| `ROLLBACK_SERIALS_MISMATCH` | `rollback_serials` count differs from `changes` count |
+| `ROLLBACK_SERIAL_NOT_ADVANCED` | Rollback serial not strictly forward per RFC 1982 |
 | `DELETE_NOT_FOUND` | Delete misses an existing RR (incl. TTL mismatch) |
 | `RECORD_DUPLICATE` | Add duplicates existing/same-change RR |
 | `TTL_MISMATCH` | RRset members carry different TTLs |
@@ -109,9 +138,10 @@ curl -s http://localhost:9090/healthz
 
 ### One-shot verification
 
-The `verify` service runs the build check, the full test suite, and an HTTP
-smoke test against the live API — including a serial-wraparound replay — then
-exits and reports the verdict via its exit code:
+The `verify` service runs the build check, the full regression suite, and an
+HTTP smoke test against the live API — including a serial-wraparound replay
+and a rollback-plan round trip — then exits and reports the verdict via its
+exit code:
 
 ```bash
 docker compose up --build verify
